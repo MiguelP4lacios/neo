@@ -26,7 +26,7 @@ Neo never edits project code from its own session. Claude Code only loads a proj
 ## Install
 
 ```bash
-claude plugin marketplace add <owner>/neo
+claude plugin marketplace add MiguelP4lacios/neo
 claude plugin install neo@neo
 ```
 
