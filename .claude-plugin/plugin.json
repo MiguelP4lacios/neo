@@ -1,0 +1,10 @@
+{
+  "name": "neo",
+  "version": "0.1.0",
+  "description": "Cross-project orchestrator and second brain for a workspace folder full of git repos. Neo never edits project code: it deploys work into projects via Orca and remembers through Engram plus file-based agent notes.",
+  "author": {
+    "name": "Miguel Palacios"
+  },
+  "license": "MIT",
+  "keywords": ["orchestrator", "workspace", "multi-repo", "orca", "engram", "worktrees", "memory"]
+}

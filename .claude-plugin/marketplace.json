@@ -1,0 +1,16 @@
+{
+  "name": "neo",
+  "owner": {
+    "name": "Miguel Palacios"
+  },
+  "metadata": {
+    "description": "Neo: a cross-project orchestrator and second brain for Claude Code."
+  },
+  "plugins": [
+    {
+      "name": "neo",
+      "source": "./",
+      "description": "Cross-project orchestrator and second brain: status, digests and Orca deployments across every repo in a workspace folder."
+    }
+  ]
+}
