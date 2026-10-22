@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Neo Slack bridge: starts at login and is relaunched by launchd if it crashes or the watchdog
+     sees a dead connection. Deliberate stops (missing token, failed refresh) exit 0 and are not
+     relaunched. Replace every __PLACEHOLDER__, then copy to ~/Library/LaunchAgents/. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.neo.slack-bridge</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__UV_PATH__</string>  <!-- `command -v uv`, e.g. /opt/homebrew/bin/uv -->
+    <string>run</string>
+    <string>--quiet</string>
+    <string>__BRIDGE_DIR__/bridge.py</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>__BRIDGE_DIR__</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>NEO_OWNER_ID</key>
+    <string>__YOUR_SLACK_USER_ID__</string>  <!-- Slack profile -> ⋮ -> Copy member ID -->
+    <key>NEO_WORKSPACE</key>
+    <string>__ORCA_SELECTOR__</string>  <!-- e.g. id:folder:UUID, the worktreeId shown by `orca worktree ps` (JSON output) -->
+    <key>NEO_SLACK_NAME</key>
+    <string>Neo</string>  <!-- the name people see in Slack -->
+    <key>NEO_TRUSTED_BOTS</key>
+    <string></string>  <!-- optional: comma-separated user/bot ids whose mentions of you count -->
+    <key>NEO_ORCA_BIN</key>
+    <string>__ORCA_PATH__</string>  <!-- `command -v orca` -->
+    <key>NEO_CLAUDE_CMD</key>
+    <string>__CLAUDE_PATH__</string>  <!-- `command -v claude` -->
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>PYTHONUNBUFFERED</key>
+    <string>1</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+  <key>StandardOutPath</key>
+  <string>__HOME__/Library/Logs/neo-slack-bridge.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/Library/Logs/neo-slack-bridge.log</string>
+</dict>
+</plist>

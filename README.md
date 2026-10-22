@@ -59,7 +59,7 @@ Start a new session afterwards so the generated `CLAUDE.md` loads.
 
 You can also just talk: "deploy the search fix to api", "what's in flight?", "what did I do yesterday?".
 
-Agents (invoked by Neo, read-only): `neo:neo-git-scout`, `neo:neo-repo-scout`, `neo:neo-memory-curator`. Optional issue-tracker and infrastructure scouts ship as templates in [`templates/integrations/`](./templates/integrations/).
+Agents (invoked by Neo, read-only): `neo:neo-git-scout`, `neo:neo-repo-scout`, `neo:neo-memory-curator`. Optional issue-tracker and infrastructure scouts ship as templates in [`templates/integrations/`](./templates/integrations/), together with an optional [Slack identity](./templates/integrations/slack/README.md) for Neo.
 
 ## Agent-notes convention
 

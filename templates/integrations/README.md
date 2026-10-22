@@ -7,6 +7,8 @@ These are **templates, not active agents**. The plugin only registers what is in
 | `neo-jira-scout.md` | Read-only view of an issue tracker (written for Jira through the Atlassian MCP server; also works for Linear or GitHub Issues after editing) | `playbooks/issue-tracker.md` |
 | `neo-infra-scout.md` | Read-only state of Kubernetes clusters, a GitOps config repo and a log backend | `playbooks/infrastructure.md` |
 
+Not a scout: [`slack/`](./slack/README.md) gives Neo its own Slack bot identity — Slack threads open Neo sessions in Orca, and replies are posted as Neo only after your approval click. It has its own setup guide.
+
 ## Enable one
 
 From your workspace root (the folder where you ran `/neo:neo-init`):
