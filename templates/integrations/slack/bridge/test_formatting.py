@@ -35,6 +35,13 @@ class RichTextTest(unittest.TestCase):
         self.assertEqual(block["elements"][0]["type"], "rich_text_preformatted")
         self.assertEqual(block["elements"][0]["elements"][0]["text"], "SELECT 1;")
 
+    def test_single_line_code_block_keeps_its_text(self):
+        block = to_rich_text("before\n```SELECT 1;```\nafter")
+        pre = [e for e in block["elements"] if e["type"] == "rich_text_preformatted"]
+        self.assertEqual(pre[0]["elements"][0]["text"], "SELECT 1;")
+        texts = [el.get("text", "") for e in block["elements"] if e["type"] == "rich_text_section" for el in e["elements"]]
+        self.assertIn("after", "".join(texts))
+
     def test_inline_elements(self):
         els = inline("hi <@U0ABC|Ana> see <!subteam^S0XYZ> *bold* _it_ `code` <https://a.b|docs> https://c.d")
         types = [(e["type"], tuple(sorted(e.get("style", {})))) for e in els if e["type"] != "text" or e.get("style")]

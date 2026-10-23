@@ -61,7 +61,13 @@ def to_rich_text(mrkdwn: str) -> dict:
     i = 0
     while i < len(lines):
         line = lines[i]
-        if line.strip().startswith("```"):
+        stripped = line.strip()
+        if len(stripped) > 6 and stripped.startswith("```") and stripped.endswith("```"):
+            # Whole code block on one line: ```SELECT 1;```
+            flush_paragraph()
+            elements.append({"type": "rich_text_preformatted",
+                             "elements": [{"type": "text", "text": stripped[3:-3].strip() or " "}]})
+        elif stripped.startswith("```"):
             flush_paragraph()
             code, i = [], i + 1
             while i < len(lines) and not lines[i].strip().startswith("```"):

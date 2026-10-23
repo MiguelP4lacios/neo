@@ -198,6 +198,9 @@ def valid_app_token() -> str | None:
     current token still works; None when the Keychain cannot be read right now."""
     global _fatal_warned
     try:
+        if not _unsaved_pair and not secret(KC_APP_TOKEN).startswith("xoxe."):
+            # A plain xapp- token (rotation off) never expires and has nothing to refresh.
+            return secret(KC_APP_TOKEN)
         if time.time() < _expires_at() - REFRESH_MARGIN_SECONDS:
             return current_app_token()
         try:

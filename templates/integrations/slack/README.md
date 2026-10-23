@@ -69,7 +69,7 @@ pick the workspace → paste [`slack-app-manifest.yaml`](./slack-app-manifest.ya
 - **Bot User OAuth Token** `xoxb-…` (Install App → Install to Workspace). The install also asks you
   to authorize the user scopes; no user token needs to be stored.
 - **Client ID** and **Client Secret** (Basic Information → App Credentials) — used only to refresh
-  the rotating app token. The Client ID is digits with a dot; do not mix it up with the Signing
+  the rotating app token. With rotation off (a plain `xapp-` token) skip them and the refresh token. The Client ID is digits with a dot; do not mix it up with the Signing
   Secret.
 
 Store them in the Keychain **from the clipboard**. The interactive `security … -w` prompt silently
