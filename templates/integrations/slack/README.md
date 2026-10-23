@@ -11,8 +11,8 @@ This is a **template, not an active part of the plugin**. Nothing runs until you
 |---|---|
 | **You** DM Neo, or mention `@Neo` in a thread | 👀 on your message, then a Neo session opens in an Orca terminal (or the thread's existing session gets the new message) and Neo DMs you the link |
 | **Someone else** DMs Neo, mentions it, or mentions **you** | Nothing runs. Neo DMs you an excerpt with **Start session** / **Dismiss** |
-| Someone writes in a thread that already has a live session | The message link is forwarded to that session; you get a short note |
-| The session wants to reply | `neo-say` sends you a DM preview with **Post as Neo** / **Discard**. Only your click posts it |
+| Someone else writes in a thread that already has a live session | You get the same DM, with **Add to session** instead of Start |
+| The session wants to reply | `neo-say` queues a draft; the bridge DMs you a preview with **Post as Neo** / **Discard**. Only your click posts it |
 
 One session per thread, one live draft per thread. Each session follows the
 [`neo-slack-triage`](./skills/neo-slack-triage/SKILL.md) skill: triage, read-only investigation,
@@ -30,7 +30,15 @@ Enforced in code, not only in prompts:
   draft can be posted once.
 - Other people's message text never goes into a session prompt: the session gets the link and reads
   the thread as data.
-- Tokens live in the macOS Keychain, never in env vars or files.
+- Tokens live in the macOS Keychain, never in env vars, files or process arguments. The bridge is the
+  only process that reads them: `neo-say` just writes a draft file, so a session never needs a token.
+- Also deny Keychain reads to Claude Code in your Neo workspace (`.claude/settings.local.json`), so a
+  session cannot fetch the bot token and post around the approval step:
+  ```json
+  { "permissions": { "deny": ["Bash(security find-generic-password:*)", "Bash(security find-internet-password:*)",
+                                "Bash(security dump-keychain:*)", "Bash(security -i:*)"] } }
+  ```
+  Deny rules match the command prefix, so treat them as a guard against mistakes, not a hard boundary.
 
 Mentions of you are found with user-level events: the bridge receives every message in **your**
 channels and acts only on `<@you>`. Nothing is stored; the log keeps the event type only.
@@ -124,6 +132,8 @@ env change in the plist, `bootout` then `bootstrap` (kickstart does not reload e
 
 - **Neo ignores a mention.** Find the message time and look for `event type=` at that second in the
   log. Present → it was filtered; absent → the connection was down.
+- **A reply did not post.** The draft is kept and the DM keeps its buttons with the error; fix the cause
+  (for example invite the bot) and click Post again.
 - **Neo looks connected but nothing arrives.** The watchdog restarts it after `NEO_WATCHDOG_SECONDS`
   of silence. A deliberate stop (missing token, failed refresh) DMs you and exits without relaunch.
 - **`invalid_refresh_token`.** Refresh tokens are single-use and the stored pair must match.

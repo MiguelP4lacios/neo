@@ -8,12 +8,13 @@ Slack is only a trigger. Each accepted event opens a visible Neo session (Claude
 in an Orca terminal, exactly like pasting a Slack link into Neo by hand.
 
 Security model, enforced here in code, not only in prompts:
-  - One owner. Only the owner's messages and button clicks start a session.
-  - Anyone else who writes to Neo is reported to the owner with a "Start session"
-    button. Nothing runs until the owner clicks it.
-  - The bridge never posts in channels. It only DMs the owner and reacts 👀 to the
-    owner's own messages. Replies in threads are the session's job, after approval.
-  - Tokens live in the macOS Keychain (never in env vars or files).
+  - One owner. Only the owner's messages and button clicks start or feed a session.
+  - Anyone else who writes to Neo or mentions the owner is reported to the owner with a
+    "Start session" button. Nothing reaches a session until the owner clicks it.
+  - The bridge never posts in channels on its own. Replies are posted only after the owner
+    clicks Post on an approval DM. The bridge is the only process that reads the bot token:
+    `neo-say` just leaves a draft request on disk.
+  - Tokens live in the macOS Keychain (never in env vars, files or process arguments).
 
 Run:  NEO_OWNER_ID=U0XXXX NEO_WORKSPACE=id:folder:<uuid> uv run bridge.py
 """
@@ -28,6 +29,7 @@ import re
 import shlex
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from collections import deque
@@ -38,6 +40,8 @@ from slack_sdk.errors import SlackApiError
 from slack_sdk.socket_mode.websocket_client import SocketModeClient
 from slack_sdk.socket_mode.request import SocketModeRequest
 from slack_sdk.socket_mode.response import SocketModeResponse
+
+from slack_format import to_rich_text
 
 OWNER_ID = os.environ["NEO_OWNER_ID"]
 # Orca selector. A folder workspace only resolves as id:<worktreeId> (e.g. id:folder:<uuid>,
@@ -56,6 +60,13 @@ KC_BOT_TOKEN = "neo-slack-bot-token"
 KC_CLIENT_ID = "neo-slack-client-id"
 KC_CLIENT_SECRET = "neo-slack-client-secret"
 
+STATE_DIR = os.path.expanduser("~/.config/neo-slack")
+STATE_FILE = os.path.join(STATE_DIR, "state.json")
+SESSIONS_FILE = os.path.join(STATE_DIR, "sessions.json")
+DRAFTS_DIR = os.path.join(STATE_DIR, "drafts")
+PENDING_DIR = os.path.join(DRAFTS_DIR, "pending")
+DRAFT_ID = re.compile(r"[0-9a-f]{12}")
+
 log = logging.getLogger("neo-bridge")
 
 
@@ -65,8 +76,27 @@ def stop(reason: str) -> None:
     sys.exit(0)
 
 
+def write_json(path: str, data: dict) -> None:
+    """Atomic write: a crash mid-write never leaves a truncated file behind."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), suffix=".tmp")
+    with os.fdopen(fd, "w") as f:
+        json.dump(data, f, indent=1)
+    os.replace(tmp, path)
+
+
+def read_json(path: str) -> dict | None:
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+# --- Keychain -------------------------------------------------------------------
 # Items created with the `security` CLI trust only that binary, so read and write
 # through it instead of a Python keychain library (which would hit an access prompt).
+
 def secret(name: str) -> str:
     result = subprocess.run(["security", "find-generic-password", "-a", ACCOUNT, "-s", name, "-w"],
                             capture_output=True, text=True)
@@ -79,30 +109,33 @@ def secret(name: str) -> str:
 
 
 def store_secret(name: str, value: str) -> None:
-    # The value is briefly visible in this process's argv; `security` has no stdin mode.
-    subprocess.run(["security", "add-generic-password", "-U", "-a", ACCOUNT, "-s", name, "-w", value],
-                   check=True, capture_output=True)
+    # Fed through `security -i` on stdin so the token never appears in a process's arguments.
+    if not re.fullmatch(r"[A-Za-z0-9.\-]+", value):
+        raise ValueError(f"refusing to store an unexpected token format in {name}")
+    subprocess.run(["security", "-i"], input=f"add-generic-password -U -a {ACCOUNT} -s {name} -w {value}\n",
+                   text=True, check=True, capture_output=True)
 
 
 bot = WebClient(token=secret(KC_BOT_TOKEN))
-_seen: deque[str] = deque(maxlen=500)
 _launches: deque[float] = deque()
 
 
 # --- app-level token rotation -------------------------------------------------
-
 # Rotating app-level tokens (xoxe.xapp-) live 12h and each refresh token is single-use:
 # https://docs.slack.dev/authentication/using-token-rotation/
 # Only the expiry time (not a secret) is kept on disk.
-STATE_FILE = os.path.expanduser("~/.config/neo-slack/state.json")
+
 REFRESH_MARGIN_SECONDS = 15 * 60
+# Answers that a retry cannot fix: the stored credentials themselves are wrong.
+FATAL_REFRESH_ERRORS = {"invalid_refresh_token", "bad_client_secret", "invalid_client_id",
+                        "invalid_grant_type", "invalid_client"}
 
 
 def _expires_at() -> float:
+    state = read_json(STATE_FILE) or {}
     try:
-        with open(STATE_FILE) as f:
-            return float(json.load(f)["app_token_expires_at"])
-    except (OSError, ValueError, KeyError):
+        return float(state["app_token_expires_at"])
+    except (KeyError, TypeError, ValueError):
         return 0.0  # unknown expiry: refresh now to learn it
 
 
@@ -119,30 +152,35 @@ def rotate_app_token() -> str:
     # The old refresh token is dead the moment it is redeemed: persist the new one first.
     store_secret(KC_APP_REFRESH, resp["refresh_token"])
     store_secret(KC_APP_TOKEN, resp["access_token"])
-    os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
-    with open(STATE_FILE, "w") as f:
-        json.dump({"app_token_expires_at": time.time() + int(resp["expires_in"])}, f)
+    write_json(STATE_FILE, {"app_token_expires_at": time.time() + int(resp["expires_in"])})
     log.info("app token rotated, expires in %ss", resp["expires_in"])
     return resp["access_token"]
 
 
 def valid_app_token() -> str:
+    """The current app token, refreshed ahead of expiry. Network trouble never stops the bridge."""
     if time.time() < _expires_at() - REFRESH_MARGIN_SECONDS:
         return secret(KC_APP_TOKEN)
     try:
         return rotate_app_token()
-    except Exception as e:  # noqa: BLE001 - any failure ends in the same manual path
-        dm_owner(f":warning: {SLACK_NAME} could not refresh its Slack app token "
-                 f"(`{e}`). Generate a new app-level token and store it in the Keychain "
-                 f"as `{KC_APP_TOKEN}` and `{KC_APP_REFRESH}`, then restart the bridge.")
-        stop("app token refresh failed")
+    except SlackApiError as e:
+        error = e.response.get("error")
+        if error in FATAL_REFRESH_ERRORS:
+            dm_owner(f":warning: {SLACK_NAME} could not refresh its Slack app token (`{error}`). "
+                     f"Generate a new app-level token and store it in the Keychain as "
+                     f"`{KC_APP_TOKEN}` and `{KC_APP_REFRESH}`, then restart the bridge.")
+            stop(f"app token refresh failed: {error}")
+        log.warning("app token refresh failed (%s); keeping the current token, retrying later", error)
+    except Exception as e:  # noqa: BLE001 - network errors, timeouts, odd responses: retry later
+        log.warning("app token refresh failed (%s); keeping the current token, retrying later", e)
+    return secret(KC_APP_TOKEN)
 
 
 # --- Slack helpers ------------------------------------------------------------
 
-def dm_owner(text: str, blocks: list | None = None) -> None:
+def dm_owner(text: str, blocks: list | None = None) -> dict:
     channel = bot.conversations_open(users=OWNER_ID)["channel"]["id"]
-    bot.chat_postMessage(channel=channel, text=text, blocks=blocks)
+    return bot.chat_postMessage(channel=channel, text=text, blocks=blocks)
 
 
 def permalink(channel: str, ts: str) -> str:
@@ -152,34 +190,28 @@ def permalink(channel: str, ts: str) -> str:
         return f"(channel {channel}, ts {ts})"
 
 
-def ask_owner(requester: str, channel: str, ts: str, text: str, verb: str = "") -> None:
-    """Someone else wrote to Neo or mentioned the owner: report it, run nothing until approved."""
-    verb = verb or f"wrote to {SLACK_NAME}"
-    link = permalink(channel, ts)
-    excerpt = (text[:300] + "…") if len(text) > 300 else text
-    quoted = "\n".join(f">{line}" for line in excerpt.splitlines())
-    value = json.dumps({"channel": channel, "ts": ts, "requester": requester})
-    dm_owner(
-        f"<@{requester}> {verb}: {link}",
-        blocks=[
-            {"type": "section", "text": {"type": "mrkdwn",
-             "text": f"<@{requester}> {verb} in {link}\n{quoted}"}},
-            {"type": "actions", "elements": [
-                {"type": "button", "style": "primary", "action_id": "neo_start",
-                 "text": {"type": "plain_text", "text": f"Start {SLACK_NAME} session"}, "value": value},
-                {"type": "button", "action_id": "neo_dismiss",
-                 "text": {"type": "plain_text", "text": "Dismiss"}, "value": value},
-            ]},
-        ],
-    )
+def mentions_user(event: dict, user_id: str) -> bool:
+    """True when the message mentions the user, in its text or in its blocks."""
+    if re.search(rf"<@{user_id}(\|[^>]*)?>", event.get("text", "")):
+        return True
+    stack = list(event.get("blocks", []))
+    while stack:
+        node = stack.pop()
+        if isinstance(node, dict):
+            if node.get("type") == "user" and node.get("user_id") == user_id:
+                return True
+            stack.extend(node.values())
+        elif isinstance(node, list):
+            stack.extend(node)
+    return False
 
 
 # --- Neo sessions in Orca -----------------------------------------------------
 # One session per Slack thread. A thread that already has a live session gets new input
 # sent into that terminal instead of opening another one.
 
-SESSIONS_FILE = os.path.expanduser("~/.config/neo-slack/sessions.json")
 LINK_RE = re.compile(r"https://[\w.-]+\.slack\.com/archives/([A-Z0-9]+)/p(\d{10})(\d{6})(\?[^|>\s]*)?")
+_route_lock = threading.Lock()  # events run on several threads; one routing decision at a time
 
 
 def thread_from_link(text: str) -> tuple[str, str] | None:
@@ -192,31 +224,25 @@ def thread_from_link(text: str) -> tuple[str, str] | None:
     return channel, thread.group(1) if thread else ts
 
 
-def _load_sessions() -> dict:
+def orca(*args: str, timeout: int = 60) -> subprocess.CompletedProcess | None:
+    """Run an orca command; None when orca is missing or too slow to answer."""
     try:
-        with open(SESSIONS_FILE) as f:
-            return json.load(f)
-    except (OSError, ValueError):
-        return {}
-
-
-def _save_sessions(sessions: dict) -> None:
-    os.makedirs(os.path.dirname(SESSIONS_FILE), exist_ok=True)
-    with open(SESSIONS_FILE, "w") as f:
-        json.dump(sessions, f, indent=1)
+        return subprocess.run([ORCA, *args, "--json"], capture_output=True, text=True, timeout=timeout)
+    except (subprocess.TimeoutExpired, OSError) as e:
+        log.error("orca %s failed: %s", args[:2], e)
+        return None
 
 
 def live_session(key: str) -> str | None:
     """Terminal handle of the thread's session if that terminal is still open."""
-    handle = _load_sessions().get(key, {}).get("handle")
+    handle = (read_json(SESSIONS_FILE) or {}).get(key, {}).get("handle")
     if not handle:
         return None
-    result = subprocess.run([ORCA, "terminal", "show", "--terminal", handle, "--json"],
-                            capture_output=True, text=True, timeout=30)
+    result = orca("terminal", "show", "--terminal", handle, timeout=30)
     try:
         term = json.loads(result.stdout)["result"]["terminal"]
         return handle if term.get("connected") and term.get("writable") else None
-    except (ValueError, KeyError, TypeError):
+    except (AttributeError, ValueError, KeyError, TypeError):
         return None
 
 
@@ -247,18 +273,16 @@ INSTRUCTIONS = (
 )
 
 
-def send_to_session(handle: str, text: str) -> bool:
-    result = subprocess.run([ORCA, "terminal", "send", "--terminal", handle, "--text", text,
-                             "--enter", "--json"], capture_output=True, text=True, timeout=60)
-    return result.returncode == 0
-
-
-def route(channel: str, thread_ts: str, requester: str, trigger_link: str = "",
-          owner_text: str = "", auto_new: bool = True) -> str:
+def route(channel: str, thread_ts: str, requester: str, trigger_link: str = "", owner_text: str = "") -> str:
     """Send the request to the thread's live session, or open one. Returns what happened."""
+    with _route_lock:
+        return _route(channel, thread_ts, requester, trigger_link, owner_text)
+
+
+def _route(channel: str, thread_ts: str, requester: str, trigger_link: str, owner_text: str) -> str:
     key = f"{channel}:{thread_ts}"
     thread_link = permalink(channel, thread_ts)
-    who = "me" if requester == OWNER_ID else f"<@{requester}>"
+    who = "me" if requester == OWNER_ID else f"<@{requester}> (I approved it)"
     # Only the owner's own words go inline; anyone else's text is reached through the link.
     said = f" My message: {owner_text}" if owner_text and requester == OWNER_ID else ""
     via = f" (message: {trigger_link})" if trigger_link and trigger_link != thread_link else ""
@@ -267,49 +291,53 @@ def route(channel: str, thread_ts: str, requester: str, trigger_link: str = "",
     if handle:
         note = (f"New activity in this same Slack thread from {who}{via}.{said} "
                 "Read it and update your triage; keep using this session. " + INSTRUCTIONS)
-        if send_to_session(handle, note):
+        result = orca("terminal", "send", "--terminal", handle, "--text", note, "--enter")
+        if result is not None and result.returncode == 0:
             return f":leftwards_arrow_with_hook: Added to the existing {SLACK_NAME} session for {thread_link}"
-        log.warning("send to %s failed, opening a new session", handle)
-    if not auto_new:
-        return ""
+        if live_session(key):
+            # Still open, just not answering: a second session would duplicate the work.
+            return f":warning: The existing {SLACK_NAME} session for {thread_link} did not take the message. Check it in Orca."
+        log.warning("session %s is gone, opening a new one", handle)
     if rate_limited():
         return f":octagonal_sign: Session limit reached ({MAX_SESSIONS_PER_HOUR}/hour). Skipped {thread_link}"
 
     prompt = (f"Slack request from {who} about this thread: {thread_link}{via}.{said}\n"
               "Read the thread and triage it with what you already know. " + INSTRUCTIONS)
-    cmd = [ORCA, "terminal", "create", "--worktree", WORKSPACE, "--title", thread_title(channel, thread_ts),
-           "--command", f"{CLAUDE} {shlex.quote(prompt)}", "--json"]
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-    if result.returncode != 0:
-        detail = (result.stderr.strip() or result.stdout.strip())  # with --json, errors go to stdout
-        log.error("orca failed: %s", detail)
+    result = orca("terminal", "create", "--worktree", WORKSPACE, "--title", thread_title(channel, thread_ts),
+                  "--command", f"{CLAUDE} {shlex.quote(prompt)}")
+    if result is None or result.returncode != 0:
+        detail = "no answer from orca" if result is None else (result.stderr.strip() or result.stdout.strip())
+        log.error("orca create failed: %s", detail)
         return f":x: Could not open a {SLACK_NAME} session for {thread_link}: `{detail[:300]}`"
     _launches.append(time.time())
     try:
         new_handle = json.loads(result.stdout)["result"]["terminal"]["handle"]
-        sessions = _load_sessions()
-        sessions[key] = {"handle": new_handle, "opened_at": time.time()}
-        _save_sessions(sessions)
     except (ValueError, KeyError, TypeError):
         log.warning("could not read the new terminal handle; this thread may get a second session")
+        return f":large_green_circle: {SLACK_NAME} session opened in Orca for {thread_link} (not tracked)"
+    sessions = read_json(SESSIONS_FILE) or {}
+    sessions[key] = {"handle": new_handle, "opened_at": time.time()}
+    write_json(SESSIONS_FILE, sessions)
     return f":large_green_circle: {SLACK_NAME} session opened in Orca for {thread_link}"
 
 
-def ask_owner(requester: str, channel: str, ts: str, thread_ts: str, text: str, verb: str = "") -> None:
+def ask_owner(requester: str, channel: str, ts: str, thread_ts: str, text: str, verb: str) -> None:
     """Someone else wrote to Neo or mentioned the owner: report it, run nothing until approved."""
-    verb = verb or f"wrote to {SLACK_NAME}"
     link = permalink(channel, ts)
     excerpt = (text[:300] + "…") if len(text) > 300 else text
     quoted = "\n".join(f">{line}" for line in excerpt.splitlines())
+    in_session = live_session(f"{channel}:{thread_ts}") is not None
+    start_label = f"Add to {SLACK_NAME} session" if in_session else f"Start {SLACK_NAME} session"
+    note = f"\n_This thread already has a {SLACK_NAME} session._" if in_session else ""
     value = json.dumps({"channel": channel, "ts": ts, "thread_ts": thread_ts, "requester": requester})
     dm_owner(
         f"<@{requester}> {verb}: {link}",
         blocks=[
             {"type": "section", "text": {"type": "mrkdwn",
-             "text": f"<@{requester}> {verb} in {link}\n{quoted}"}},
+             "text": f"<@{requester}> {verb} in {link}\n{quoted}{note}"}},
             {"type": "actions", "elements": [
                 {"type": "button", "style": "primary", "action_id": "neo_start",
-                 "text": {"type": "plain_text", "text": f"Start {SLACK_NAME} session"}, "value": value},
+                 "text": {"type": "plain_text", "text": start_label}, "value": value},
                 {"type": "button", "action_id": "neo_dismiss",
                  "text": {"type": "plain_text", "text": "Dismiss"}, "value": value},
             ]},
@@ -319,12 +347,21 @@ def ask_owner(requester: str, channel: str, ts: str, thread_ts: str, text: str, 
 
 # --- event routing ------------------------------------------------------------
 
-_seen_messages: deque[str] = deque(maxlen=500)
-
+_seen: deque[str] = deque(maxlen=1000)
+_seen_lock = threading.Lock()
 
 # Bots whose mentions of the owner are worth a triage (e.g. a ticket bot assigning a bug).
 # Comma-separated user ids and/or bot ids. Every other bot is ignored, Neo included.
 TRUSTED_BOTS = {b.strip() for b in os.environ.get("NEO_TRUSTED_BOTS", "").split(",") if b.strip()}
+
+
+def first_time(key: str) -> bool:
+    """Check-and-mark in one step: Slack retries and one message can arrive as two events."""
+    with _seen_lock:
+        if key in _seen:
+            return False
+        _seen.append(key)
+        return True
 
 
 def handle_event(event: dict) -> None:
@@ -340,75 +377,145 @@ def handle_event(event: dict) -> None:
     channel, ts = event["channel"], event["ts"]
     is_dm = kind == "message" and event.get("channel_type") == "im"
     # User-level events: every message in the owner's channels arrives; act only on mentions
-    # of the owner by someone else. Nothing is stored. Bots often put the mention only in blocks.
-    searchable = event.get("text", "") + json.dumps(event.get("blocks", []))
+    # of the owner by someone else. Nothing is stored.
     mentions_owner = (kind == "message" and event.get("channel_type") in ("channel", "group")
-                      and user != OWNER_ID
-                      and re.search(rf"<@{OWNER_ID}(\|[^>]*)?>|\"user_id\": \"{OWNER_ID}\"", searchable) is not None)
+                      and user != OWNER_ID and mentions_user(event, OWNER_ID))
     if from_trusted_bot and not mentions_owner:
         return  # trusted bots only count when they mention the owner
     if kind != "app_mention" and not is_dm and not mentions_owner:
         return
-    if f"{channel}:{ts}" in _seen_messages:
-        return  # one message can arrive as both app_mention and a user event
-    _seen_messages.append(f"{channel}:{ts}")
+    if not first_time(f"msg:{channel}:{ts}"):
+        return
     text = event.get("text", "")
     # The thread this is about: a DM to Neo points at it with a link; elsewhere it is this thread.
     target = (thread_from_link(text) if is_dm else None) or (channel, event.get("thread_ts", ts))
     if user == OWNER_ID:
-        bot.reactions_add(channel=channel, name="eyes", timestamp=ts)
+        try:
+            bot.reactions_add(channel=channel, name="eyes", timestamp=ts)
+        except SlackApiError as e:
+            log.warning("could not react: %s", e.response.get("error"))
         dm_owner(route(*target, user, permalink(channel, ts) if not is_dm else "", text))
         return
+    # Anyone else, even in a thread that already has a session: the owner decides.
     verb = "mentioned you" if mentions_owner and kind != "app_mention" else f"wrote to {SLACK_NAME}"
-    if not is_dm:
-        # The owner already opened a session for this thread: pass the new message's link along.
-        outcome = route(*target, user, permalink(channel, ts), auto_new=False)
-        if outcome:
-            dm_owner(f"<@{user}> {verb} in a thread you are already on. {outcome}")
-            return
     ask_owner(user, channel, ts, target[1], text, verb)
 
 
-DRAFTS_DIR = os.path.expanduser("~/.config/neo-slack/drafts")
+# --- drafts: approval DMs and posting -------------------------------------------
+# `neo-say` writes drafts/pending/<id>.json. This bridge sends the approval DM, keeps the
+# draft as drafts/<id>.json and posts it only when the owner clicks Post.
+
+def update_dm(payload: dict, outcome: str, keep_buttons: bool = False) -> None:
+    """Add the outcome to the DM; drop the buttons unless the owner may still act on it."""
+    blocks = [b for b in payload["message"].get("blocks", [])
+              if keep_buttons or b.get("type") != "actions"]
+    blocks = [b for b in blocks if b.get("block_id") != "neo_outcome"]
+    blocks.append({"type": "context", "block_id": "neo_outcome",
+                   "elements": [{"type": "mrkdwn", "text": outcome}]})
+    bot.chat_update(channel=payload["channel"]["id"], ts=payload["message"]["ts"], text=outcome, blocks=blocks)
 
 
-def close_buttons(payload: dict, outcome: str) -> None:
-    """Replace the buttons with the outcome so the same DM cannot be acted on twice."""
-    blocks = [b for b in payload["message"].get("blocks", []) if b.get("type") != "actions"]
-    blocks.append({"type": "context", "elements": [{"type": "mrkdwn", "text": outcome}]})
-    bot.chat_update(channel=payload["channel"]["id"], ts=payload["message"]["ts"],
-                    text=outcome, blocks=blocks)
+def supersede(channel: str, thread_ts: str) -> None:
+    """Retire approved-pending drafts for the same thread: only the newest one can be posted."""
+    for name in os.listdir(DRAFTS_DIR):
+        if not name.endswith(".json"):
+            continue
+        path = os.path.join(DRAFTS_DIR, name)
+        old = read_json(path)
+        if not old or (old.get("channel"), old.get("thread_ts")) != (channel, thread_ts):
+            continue
+        os.remove(path)
+        if old.get("dm_channel") and old.get("dm_ts"):
+            outcome = ":arrows_counterclockwise: Superseded by a newer draft."
+            try:
+                bot.chat_update(channel=old["dm_channel"], ts=old["dm_ts"], text=outcome, blocks=[
+                    {"type": "section", "text": {"type": "mrkdwn", "text": f"~Old draft for this thread~\n{outcome}"}}])
+            except SlackApiError as e:
+                log.warning("could not retire old draft DM: %s", e.response.get("error"))
 
 
-def take_draft(draft_id: str) -> dict | None:
-    """Claim a draft exactly once: the file is removed before anything is posted."""
-    if not re.fullmatch(r"[0-9a-f]{12}", draft_id):
+def send_preview(draft_id: str, draft: dict) -> None:
+    where = permalink(draft["channel"], draft["thread_ts"])
+    supersede(draft["channel"], draft["thread_ts"])
+    sent = dm_owner(
+        f"{SLACK_NAME} wants to reply in {where}",
+        blocks=[
+            {"type": "section", "text": {"type": "mrkdwn", "text": f"*Proposed reply as {SLACK_NAME}* in {where}"}},
+            to_rich_text(draft["text"]),
+            {"type": "actions", "elements": [
+                {"type": "button", "style": "primary", "action_id": "neo_post", "value": draft_id,
+                 "text": {"type": "plain_text", "text": f"Post as {SLACK_NAME}"}},
+                {"type": "button", "action_id": "neo_discard", "value": draft_id,
+                 "text": {"type": "plain_text", "text": "Discard"}},
+            ]},
+        ],
+    )
+    write_json(os.path.join(DRAFTS_DIR, f"{draft_id}.json"),
+               {**draft, "dm_channel": sent["channel"], "dm_ts": sent["ts"]})
+
+
+def watch_pending() -> None:
+    """Turn neo-say requests into approval DMs. A failed send stays pending and is retried."""
+    attempts: dict[str, int] = {}
+    while True:
+        try:
+            os.makedirs(PENDING_DIR, exist_ok=True)
+            for name in sorted(os.listdir(PENDING_DIR)):
+                draft_id = name.removesuffix(".json")
+                if not name.endswith(".json") or not DRAFT_ID.fullmatch(draft_id):
+                    continue
+                path = os.path.join(PENDING_DIR, name)
+                draft = read_json(path)
+                if not draft or not {"channel", "thread_ts", "text"} <= draft.keys():
+                    continue
+                try:
+                    send_preview(draft_id, draft)
+                    os.remove(path)
+                    attempts.pop(draft_id, None)
+                except Exception as e:  # noqa: BLE001 - retry on the next pass
+                    attempts[draft_id] = attempts.get(draft_id, 0) + 1
+                    log.warning("approval DM for draft %s failed (%s), attempt %s", draft_id, e, attempts[draft_id])
+                    if attempts[draft_id] >= 10:
+                        os.replace(path, path + ".failed")
+                        log.error("gave up on draft %s", draft_id)
+        except Exception:  # noqa: BLE001 - the watcher must never die
+            log.exception("pending drafts watcher error")
+        time.sleep(2)
+
+
+def take_draft(draft_id: str) -> tuple[str, dict] | None:
+    """Claim a draft exactly once: the file is moved away before anything is posted."""
+    if not DRAFT_ID.fullmatch(draft_id):
         return None
     path = os.path.join(DRAFTS_DIR, f"{draft_id}.json")
+    claimed = path + ".posting"
     try:
-        with open(path) as f:
-            draft = json.load(f)
-        os.remove(path)
-        return draft
+        os.replace(path, claimed)
     except FileNotFoundError:
         return None
+    draft = read_json(claimed)
+    return (claimed, draft) if draft else None
 
 
 def post_draft(payload: dict, draft_id: str) -> None:
-    draft = take_draft(draft_id)
-    if draft is None:
-        close_buttons(payload, ":grey_question: This draft was already handled.")
+    taken = take_draft(draft_id)
+    if taken is None:
+        update_dm(payload, ":grey_question: This draft was already handled.")
         return
+    claimed, draft = taken
     try:
-        # Same mrkdwn format as the approval preview: what the owner approved is what gets posted.
+        # Same rich_text block as the approval preview: what the owner approved is what gets
+        # posted. `text` stays as the notification fallback and keeps the mentions.
         resp = bot.chat_postMessage(channel=draft["channel"], thread_ts=draft["thread_ts"],
-                                    text=draft["text"])
-    except SlackApiError as e:
-        error = e.response.get("error")
-        hint = f" Invite @{SLACK_NAME} to that channel first." if error in ("not_in_channel", "channel_not_found") else ""
-        close_buttons(payload, f":x: Not posted (`{error}`).{hint}")
+                                    text=draft["text"], blocks=[to_rich_text(draft["text"])])
+    except Exception as e:  # noqa: BLE001 - keep the draft so the owner can retry
+        os.replace(claimed, claimed.removesuffix(".posting"))
+        error = e.response.get("error") if isinstance(e, SlackApiError) else type(e).__name__
+        hint = f" Invite @{SLACK_NAME} to that channel, then" if error in ("not_in_channel", "channel_not_found") else ""
+        update_dm(payload, f":x: Not posted (`{error}`).{hint} Click Post to retry.", keep_buttons=True)
         return
-    close_buttons(payload, f":white_check_mark: Posted as {SLACK_NAME}: {permalink(draft['channel'], resp['ts'])}")
+    os.remove(claimed)
+    update_dm(payload, f":white_check_mark: Posted as {SLACK_NAME}: {permalink(draft['channel'], resp['ts'])}")
 
 
 def handle_action(payload: dict) -> None:
@@ -421,19 +528,26 @@ def handle_action(payload: dict) -> None:
         data = json.loads(value)
         outcome = route(data["channel"], data.get("thread_ts", data["ts"]), data["requester"],
                         permalink(data["channel"], data["ts"]))
-        close_buttons(payload, outcome)
+        update_dm(payload, outcome)
     elif kind == "neo_dismiss":
-        close_buttons(payload, ":heavy_minus_sign: Dismissed.")
+        update_dm(payload, ":heavy_minus_sign: Dismissed.")
     elif kind == "neo_post":
         post_draft(payload, value)
     elif kind == "neo_discard":
-        take_draft(value)
-        close_buttons(payload, ":wastebasket: Draft discarded.")
+        taken = take_draft(value)
+        if taken:
+            os.remove(taken[0])
+        update_dm(payload, ":wastebasket: Draft discarded.")
 
+
+# --- Socket Mode ----------------------------------------------------------------
 
 # The owner's channels produce events all day; a long silence means a dead connection that
 # still looks alive. The watchdog exits non-zero and launchd starts a fresh process.
-WATCHDOG_SECONDS = int(os.environ.get("NEO_WATCHDOG_SECONDS", str(15 * 60)))
+try:
+    WATCHDOG_SECONDS = max(120, int(os.environ.get("NEO_WATCHDOG_SECONDS", "900")))
+except ValueError:
+    WATCHDOG_SECONDS = 900
 _last_event = time.time()
 
 
@@ -441,9 +555,8 @@ def process(client: SocketModeClient, req: SocketModeRequest) -> None:
     global _last_event
     _last_event = time.time()
     client.send_socket_mode_response(SocketModeResponse(envelope_id=req.envelope_id))
-    if req.envelope_id in _seen:
+    if not first_time(f"env:{req.envelope_id}"):
         return  # Slack retries delivery; act once
-    _seen.append(req.envelope_id)
     try:
         if req.type == "events_api":
             event = req.payload.get("event", {})
@@ -458,9 +571,11 @@ def process(client: SocketModeClient, req: SocketModeRequest) -> None:
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    os.makedirs(PENDING_DIR, exist_ok=True)
     client = SocketModeClient(app_token=valid_app_token(), web_client=bot)
     client.socket_mode_request_listeners.append(process)
     client.connect()
+    threading.Thread(target=watch_pending, name="pending-drafts", daemon=True).start()
     log.info("Neo bridge connected; owner=%s workspace=%s", OWNER_ID, WORKSPACE)
     while True:  # refresh ahead of the 12h expiry so reconnects always use a live token
         time.sleep(60)

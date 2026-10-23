@@ -40,4 +40,6 @@ settings:
     is_enabled: true        # Approve / Discard buttons
   org_deploy_enabled: false
   socket_mode_enabled: true
+  # Rotation of the OAuth (bot/user) tokens. App-level token rotation is a separate setting
+  # under App-Level Tokens; when it is on, the bridge refreshes that token itself.
   token_rotation_enabled: false
