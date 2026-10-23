@@ -21,19 +21,18 @@ import sys
 import tempfile
 import time
 import uuid
-from urllib.parse import parse_qs, urlparse
+
+from slack_links import thread_from_link
 
 PENDING_DIR = os.path.expanduser("~/.config/neo-slack/drafts/pending")
 
 
 def parse_link(link: str) -> tuple[str, str]:
-    """https://x.slack.com/archives/C123/p1792457823946789?thread_ts=... -> (C123, thread ts)."""
-    url = urlparse(link)
-    match = re.search(r"/archives/([A-Z0-9]+)/p(\d{10})(\d{6})", url.path)
-    if not match:
+    """Slack message link -> (channel, thread ts)."""
+    target = thread_from_link(link)
+    if not target:
         sys.exit(f"neo-say: not a Slack message link: {link}")
-    channel, ts = match.group(1), f"{match.group(2)}.{match.group(3)}"
-    return channel, parse_qs(url.query).get("thread_ts", [ts])[0]
+    return target
 
 
 def main() -> None:

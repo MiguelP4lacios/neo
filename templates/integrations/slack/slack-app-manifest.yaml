@@ -37,7 +37,7 @@ settings:
       - message.channels    # every message in the owner's channels; the bridge acts only on mentions
       - message.groups
   interactivity:
-    is_enabled: true        # Approve / Discard buttons
+    is_enabled: true        # Start / Dismiss and Post / Discard buttons in the owner's DMs
   org_deploy_enabled: false
   socket_mode_enabled: true
   # Rotation of the OAuth (bot/user) tokens. App-level token rotation is a separate setting
