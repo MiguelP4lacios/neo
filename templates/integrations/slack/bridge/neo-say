@@ -1,0 +1,5 @@
+#!/bin/sh
+# Propose a Slack reply as Neo; the owner approves it in a DM before anything is posted.
+# Install: copy to a directory on PATH (e.g. ~/.local/bin) and set BRIDGE_DIR below.
+BRIDGE_DIR="__BRIDGE_DIR__"
+exec uv run --quiet "$BRIDGE_DIR/neo_say.py" "$@"

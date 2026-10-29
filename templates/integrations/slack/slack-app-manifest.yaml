@@ -1,0 +1,45 @@
+# Slack app manifest for Neo.
+# Paste at https://api.slack.com/apps -> Create New App -> From a manifest.
+# Socket Mode: events reach the local bridge over a WebSocket, no public URL needed.
+display_information:
+  name: Neo
+  description: Personal orchestrator. Works only for its owner; every action needs the owner's approval.
+  background_color: "#0b3d2e"
+features:
+  app_home:
+    home_tab_enabled: false
+    messages_tab_enabled: true
+    messages_tab_read_only_enabled: false
+  bot_user:
+    display_name: Neo
+    always_online: true
+oauth_config:
+  scopes:
+    bot:
+      - app_mentions:read   # someone writes @Neo
+      - chat:write          # reply in threads, only after owner approval
+      - im:history          # read the owner's DMs to Neo
+      - im:read
+      - im:write            # open the DM to notify the owner
+      - channels:history    # read thread context in public channels Neo was invited to
+      - groups:history      # same, private channels
+      - reactions:write     # 👀 ack on the triggering message
+      - users:read          # resolve names for triage summaries
+    user:
+      - channels:history    # owner's public channels: lets the bridge spot @owner mentions
+      - groups:history      # owner's private channels, same purpose
+settings:
+  event_subscriptions:
+    bot_events:
+      - app_mention
+      - message.im
+    user_events:
+      - message.channels    # every message in the owner's channels; the bridge acts only on mentions
+      - message.groups
+  interactivity:
+    is_enabled: true        # Start / Dismiss and Post / Discard buttons in the owner's DMs
+  org_deploy_enabled: false
+  socket_mode_enabled: true
+  # Rotation of the OAuth (bot/user) tokens. App-level token rotation is a separate setting
+  # under App-Level Tokens; when it is on, the bridge refreshes that token itself.
+  token_rotation_enabled: false
